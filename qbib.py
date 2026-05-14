@@ -11,7 +11,7 @@ import urllib.request
 import urllib.error
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
-
+from html import unescape
 
 BIB_REPLACEMENTS = [
     ("Markov", r"{M}arkov"),
@@ -192,7 +192,9 @@ def get_bibtex_from_info(info: dict, condensed: bool):
     bibtex = bibtex[:-1] + "\n}" # cut away last comma and add closing bracket
     return bibtex
     
-
+def prettify_html(text : str) -> str:
+    return unescape(text.strip())
+    
 def normalize_authors_json(authors_field) -> str:
     """
     Handles DBLP JSON author formats, e.g.
@@ -219,37 +221,52 @@ def normalize_authors_json(authors_field) -> str:
     else:
         names = [name_of(a)]
 
-    names = [n for n in names if n]
+    names = [prettify_html(n) for n in names if n]
     return ", ".join(names)
 
 def get_info_item(info, key):
     res = info.get(key) or ""
     if isinstance(res, list):
         res = ", ".join([r.strip() for r in res])
-    return res.strip()
+    return prettify_html(res)
 
 def print_hits(infos):
     width = shutil.get_terminal_size((120, 20)).columns
+    current_year = "unkn"
+    
     for i, info in enumerate(infos, start=1):
         title = get_info_item(info, "title")
         year = get_info_item(info, "year")
         year = "unkn" if  year == "" else year
         venue = get_info_item(info, "venue")
         authors = normalize_authors_json((info.get("_authors_str") or "").strip())
+        
+        if year != current_year:
+            print(f"\033[1m\033[36m{year}\033[0m")
+            current_year = year
 
-        # Line 1: Year: Authors:
-        line1 = f"{year}: {authors}"
-        print(f"{i:>2}. " + line1)
+        # Line 1: Authors:
+        print(f"{i:>2}. {authors}:")
 
         # Line 2: Title. Venue
-        title = '\033[1m' + title + '\033[0m'
-        meta_parts = [p for p in [title, venue] if p]
-        line2 = " ".join(meta_parts)
-        print("    " + line2)
+        line2 = "    > "
+        line2 += f"\033[1m{title}\033[0m"
+        if venue == "CoRR":
+            venue = "\033[31m" + venue + "\033[0m"
+        elif venue == "Zenodo":
+            venue = "\033[34m" + venue + "\033[0m"
+        elif venue is not None:
+            venue = "\033[33m" + venue + "\033[0m"
+        if venue is not None:
+            line2 += f" {venue}"
+        print(line2)
 
 def prompt_choice(n: int) -> int:
     while True:
-        s = input(f"\nSelect an entry [1-{n}] (\033[1mq\033[0muit, \033[1mc\033[0mondensed, \033[1mo\033[0mpen url): ").strip()
+        try:
+            s = input(f"\nSelect an entry [1-{n}] (\033[1mq\033[0muit, \033[1mc\033[0mondensed, \033[1mo\033[0mpen url): ").strip()
+        except KeyboardInterrupt:
+            s = "q"
         if s in {"0", "q", "quit", "exit"} or "q" in s:
             return 0, False, False
         try:

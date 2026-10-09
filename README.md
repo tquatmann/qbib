@@ -2,6 +2,18 @@
 **Q**uickly search DBLP from command line and get **bib**tex output
 
 
+## Setup
+
+qbib searches a local index of the DBLP data dump (the DBLP search API is protected by a bot check).
+Build or refresh it with
+
+```
+python3 qbib.py --update
+```
+
+This streams the latest `dblp.xml.gz` (about 1 GB) from DBLP and indexes it into `~/.cache/qbib/dblp.sqlite`
+(set `QBIB_DATA_DIR` to change the location). It takes a few minutes; re-running it does nothing if the dump is unchanged.
+
 ## Usage
 
 Search DBLP for some search terms, e.g. `donald knuth`:

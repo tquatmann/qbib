@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 import argparse
+import gzip
+import html.entities
 import json
+import os
+import re
+import sqlite3
 import sys
 import time
 import shutil
 import subprocess
+import unicodedata
 import webbrowser
-import urllib.parse
 import urllib.request
 import urllib.error
 import xml.etree.ElementTree as ET
-from collections import OrderedDict
 from html import unescape
 
 BIB_REPLACEMENTS = [
@@ -27,202 +31,354 @@ BIB_REPLACEMENTS = [
     (r"Kret{\'{\i}}nsk{\'{y}}", r"K{\v r}et{\' i}nsk{\' y}"),
 ]
 
-BIB_UNWANTED_KEYS = ["biburl","bibsource","timestamp"]
-
-# DBLP Mirrors
-DEFAULT_BASES = [
-    "https://dblp.uni-trier.de",
-    "https://dblp.dagstuhl.de",
-    "https://dblp.org",
+# DBLP data dump mirrors (the search API is behind a bot check, the dump is not)
+DUMP_URLS = [
+    "https://dblp.org/xml/dblp.xml.gz",
+    "https://dblp.uni-trier.de/xml/dblp.xml.gz",
+    "https://dblp.dagstuhl.de/xml/dblp.xml.gz",
 ]
 
-SEARCH_PATH = "/search/publ/api"
-REC_PATH_PREFIX = "/rec/"
-
-def http_get_text(urlsuffix: str, timeout: float = 20.0, retries: int = 4) -> str:
-    last_err = None
-    for attempt in range(retries):
-        base = DEFAULT_BASES[attempt % len(DEFAULT_BASES)]
-        url = base + urlsuffix
-        if attempt > 0:
-            print("API request failed. Next attempt\n\t{}".format(url))
-        try:
-            req = urllib.request.Request(
-                url,
-                headers={
-                    # A descriptive UA helps; DBLP may throttle/deny ambiguous clients.
-                    "User-Agent": "dblp-bibtex-cli/1.1 (mailto:you@example.com)",
-                    "Accept": "*/*",
-                },
-            )
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                charset = resp.headers.get_content_charset() or "utf-8"
-                return resp.read().decode(charset, errors="replace")
-        except urllib.error.HTTPError as e:
-            # Read body for diagnostics; then maybe retry on 5xx
-            body = ""
-            try:
-                body = e.read().decode("utf-8", errors="replace")
-            except Exception:
-                pass
-            last_err = RuntimeError(f"HTTP Error {e.code} for {url}\n{body[:800]}")
-            if 500 <= e.code < 600 and attempt < retries - 1:
-                time.sleep(0.8 * (2 ** attempt))
-                continue
-            raise last_err
-        except Exception as e:
-            last_err = e
-            if attempt < retries - 1:
-                time.sleep(0.8 * (2 ** attempt))
-                continue
-            raise
-    raise last_err or RuntimeError("Request failed")
+# record types of dblp.xml that we index (everything else, e.g. <www> homepages, is skipped)
+RECORD_TAGS = {"article", "inproceedings", "proceedings", "book", "incollection",
+               "phdthesis", "mastersthesis", "data"}
+# child elements that we keep for every record
+FIELD_TAGS = {"author", "editor", "title", "booktitle", "journal", "volume", "number",
+              "pages", "year", "publisher", "series", "school", "isbn", "crossref", "ee",
+              "chapter"}
+# order in which fields are written to BibTeX
+BIB_FIELD_ORDER = ["author", "editor", "title", "booktitle", "journal", "volume", "number",
+                   "chapter", "pages", "year", "publisher", "series", "school", "isbn"]
 
 
-def normalize_authors_json(authors_field) -> str:
-    if not authors_field:
-        return ""
-    a = authors_field.get("author")
-    if not a:
-        return ""
-    if isinstance(a, list):
-        out = []
-        for item in a:
-            if isinstance(item, dict) and "@text" in item:
-                out.append(item["@text"])
-            else:
-                out.append(str(item))
-        return ", ".join(out)
-    if isinstance(a, dict) and "@text" in a:
-        return a["@text"]
-    return str(a)
+def data_dir() -> str:
+    base = os.environ.get("QBIB_DATA_DIR")
+    if not base:
+        base = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "qbib")
+    return base
 
 
-def search_dblp_json(query: str, max_hits: int = 20):
-    params = {"q": query, "format": "json", "h": str(max_hits)}
-    url = SEARCH_PATH + "?" + urllib.parse.urlencode(params)
-    raw = http_get_text(url)
-    data = json.loads(raw)
-    hits = data.get("result", {}).get("hits", {}).get("hit", [])
-    if isinstance(hits, dict):
-        hits = [hits]
-    # unify shape to match the rest of the code (hit["info"] dict)
-    return [h.get("info", {}) for h in hits]
+def db_path() -> str:
+    return os.path.join(data_dir(), "dblp.sqlite")
 
 
-def search_dblp_xml(query: str, max_hits: int = 20):
-    params = {"q": query, "format": "xml", "h": str(max_hits)}
-    url = SEARCH_PATH + "?" + urllib.parse.urlencode(params)
-    raw = http_get_text(url)
-    root = ET.fromstring(raw)
+# ---------------------------------------------------------------------------
+# Updating the local index
+# ---------------------------------------------------------------------------
 
-    infos = []
-    for hit in root.findall(".//hit"):
-        info = hit.find("info")
-        if info is None:
+class CountingReader:
+    """Wraps a response and reports download progress on stderr."""
+    def __init__(self, resp, total):
+        self.resp, self.total, self.n, self.last = resp, total, 0, 0.0
+
+    def read(self, size=-1):
+        chunk = self.resp.read(size)
+        self.n += len(chunk)
+        now = time.time()
+        if now - self.last > 0.5 or not chunk:
+            self.last = now
+            pct = f" ({100 * self.n / self.total:.0f}%)" if self.total else ""
+            print(f"\r  read {self.n / 1e6:,.0f} MB{pct}", end="", file=sys.stderr, flush=True)
+        return chunk
+
+
+def open_dump(url: str, timeout: float = 30.0):
+    req = urllib.request.Request(url, headers={"User-Agent": "qbib/2.0 (local dblp index)"})
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def head_dump(url: str, timeout: float = 30.0) -> dict:
+    req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "qbib/2.0 (local dblp index)"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return {k.lower(): v for k, v in resp.headers.items()}
+
+
+def record_from_elem(elem):
+    fields = {}
+    for child in elem:
+        if child.tag in FIELD_TAGS:
+            # itertext flattens inline markup like <i>, <sub>, <sup>
+            text = "".join(child.itertext()).strip()
+            if text:
+                fields.setdefault(child.tag, []).append(text)
+    return {"type": elem.tag, "key": elem.get("key"), "f": fields}
+
+
+def index_stream(stream, conn):
+    """Parse a dblp.xml stream and fill the database. Returns the number of records."""
+    parser = ET.XMLParser()
+    # dblp.xml uses entities (&uuml; ...) declared in dblp.dtd, which expat does not load
+    for name, cp in html.entities.name2codepoint.items():
+        parser.entity[name] = chr(cp)
+    root = None
+    count = 0
+    batch = []
+
+    def flush():
+        cur = conn.cursor()
+        for rec, (title, authors, venue, year) in batch:
+            cur.execute("INSERT INTO rec(key, data) VALUES (?, ?)", (rec["key"], json.dumps(rec, ensure_ascii=False)))
+            cur.execute("INSERT INTO fts(rowid, title, authors, venue, year) VALUES (?, ?, ?, ?, ?)",
+                        (cur.lastrowid, title, authors, venue, year))
+        batch.clear()
+
+    for event, elem in ET.iterparse(stream, events=("start", "end"), parser=parser):
+        if event == "start":
+            if root is None:
+                root = elem
             continue
-        def t(tag): return (info.findtext(tag) or "").strip()
-        authors = [a.text.strip() for a in info.findall("./authors/author") if a.text]
-        infos.append({
-            "title": t("title"),
-            "year": t("year"),
-            "venue": t("venue"),
-            "url": t("url"),
-            "key": t("key"),
-            "_authors_str": ", ".join(authors),
-        })
-    return infos
+        if elem.tag not in RECORD_TAGS:
+            continue
+        rec = record_from_elem(elem)
+        elem.clear()
+        root.clear()
+        if not rec["key"] or "title" not in rec["f"]:
+            continue
+        info = info_from_record(rec)
+        batch.append((rec, (info["title"], info["authors"], info["venue"], info["year"])))
+        count += 1
+        if len(batch) >= 20000:
+            flush()
+    flush()
+    return count
+
+
+def update_index() -> int:
+    os.makedirs(data_dir(), exist_ok=True)
+    final = db_path()
+    tmp = final + ".new"
+
+    # find a mirror that answers and check whether we are already up to date
+    url, meta = None, None
+    for candidate in DUMP_URLS:
+        try:
+            meta = head_dump(candidate)
+            url = candidate
+            break
+        except Exception as e:
+            print(f"Could not reach {candidate}: {e}", file=sys.stderr)
+    if url is None:
+        print("No DBLP mirror reachable.", file=sys.stderr)
+        return 1
+    remote_id = f"{url}|{meta.get('etag', '')}|{meta.get('last-modified', '')}"
+    if os.path.exists(final):
+        try:
+            with sqlite3.connect(final) as conn:
+                local = dict(conn.execute("SELECT k, v FROM meta").fetchall())
+            if local.get("source") == remote_id:
+                print(f"Local index is already up to date ({local.get('records')} records, "
+                      f"DBLP dump from {meta.get('last-modified', 'unknown date')}).")
+                return 0
+        except sqlite3.Error:
+            pass  # unreadable index: rebuild
+
+    total = int(meta.get("content-length") or 0)
+    print(f"Downloading and indexing {url} ({total / 1e9:.2f} GB). This takes a few minutes.")
+    if os.path.exists(tmp):
+        os.remove(tmp)
+    conn = sqlite3.connect(tmp)
+    try:
+        conn.executescript("""
+            PRAGMA journal_mode = OFF;
+            PRAGMA synchronous = OFF;
+            CREATE TABLE rec(id INTEGER PRIMARY KEY, key TEXT, data TEXT);
+            CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT);
+            CREATE VIRTUAL TABLE fts USING fts5(title, authors, venue, year, content='', columnsize=0,
+                                                tokenize='unicode61 remove_diacritics 2');
+        """)
+        with open_dump(url) as resp:
+            reader = CountingReader(resp, total)
+            with gzip.GzipFile(fileobj=reader) as gz:
+                count = index_stream(gz, conn)
+        print(file=sys.stderr)
+        print("Building key index ...")
+        conn.execute("CREATE UNIQUE INDEX rec_key ON rec(key)")
+        conn.executemany("INSERT INTO meta VALUES (?, ?)",
+                         [("source", remote_id), ("records", str(count)), ("updated", time.strftime("%Y-%m-%d %H:%M:%S"))])
+        conn.commit()
+        conn.close()
+        os.replace(tmp, final)
+    except BaseException:
+        conn.close()
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        print(file=sys.stderr)
+        raise
+    print(f"Done: {count:,} records indexed in {final}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Searching the local index
+# ---------------------------------------------------------------------------
+
+def strip_homonym(name: str) -> str:
+    """DBLP disambiguates equal names with a number, e.g. 'Manish Singh 0001'."""
+    return re.sub(r"\s+\d{4}$", "", name)
+
+
+def info_from_record(rec: dict) -> dict:
+    f = rec["f"]
+    venue = (f.get("journal") or f.get("booktitle") or f.get("series") or f.get("school") or [""])[0]
+    people = f.get("author") or f.get("editor") or []
+    ee = f.get("ee", [])
+    doi = next((e.split("doi.org/", 1)[1] for e in ee if "doi.org/" in e), None)
+    info = {
+        "key": rec["key"],
+        "type": rec["type"],
+        "title": f.get("title", [""])[0].rstrip("."),
+        "year": (f.get("year") or [""])[0],
+        "venue": venue,
+        "authors": ", ".join(strip_homonym(p) for p in people),
+        "ee": ee[0] if ee else None,
+        "rec": rec,
+    }
+    if doi:
+        info["doi"] = doi
+    return info
+
+
+def fts_query(terms) -> str:
+    # every term must match (prefix match for the last-typed flexibility); quote to avoid FTS syntax
+    parts = []
+    for t in terms:
+        for word in re.findall(r"\w+", t):
+            parts.append('"' + word + '"*')
+    return " ".join(parts)
 
 
 def search_dblp(query: str, max_hits: int = 20):
-    # Try JSON first; if DBLP errors, fall back to XML.
+    path = db_path()
+    if not os.path.exists(path):
+        print("No local DBLP index found. Run `qbib.py --update` first.", file=sys.stderr)
+        raise SystemExit(1)
+    q = fts_query([query])
+    if not q:
+        return []
+    conn = sqlite3.connect(path)
     try:
-        infos = search_dblp_json(query, max_hits=max_hits)
-        # annotate authors string for printing convenience
-        for info in infos:
-            info["_authors_str"] = normalize_authors_json(info.get("authors", {}))
-        return infos
-    except Exception:
-        return search_dblp_xml(query, max_hits=max_hits)
+        rows = conn.execute(
+            "SELECT rec.data FROM fts JOIN rec ON rec.id = fts.rowid WHERE fts MATCH ? ORDER BY fts.rank LIMIT ?",
+            (q, max_hits)).fetchall()
+    finally:
+        conn.close()
+    return [info_from_record(json.loads(r[0])) for r in rows]
 
 
-def bibtex_url_from_info(info: dict, condensed: bool) -> str:
-    key = (info.get("key") or "").strip()
-    if key:
-        param = 0 if condensed else 1
-        return f"{REC_PATH_PREFIX}{key}.bib?param={param}"
-    rec_url = (info.get("url") or "").strip()
-    if rec_url.endswith(".html"):
-        return rec_url[:-5] + ".bib"
-    if rec_url and not rec_url.endswith(".bib"):
-        return rec_url + ".bib"
-    return rec_url
+def get_record(key: str):
+    conn = sqlite3.connect(db_path())
+    try:
+        row = conn.execute("SELECT data FROM rec WHERE key = ?", (key,)).fetchone()
+    finally:
+        conn.close()
+    return json.loads(row[0]) if row else None
 
-def bibtex_has_key(bibtex: str, key: str):
-    return any([l.strip().startswith(key) for l in bibtex.split("\n")])
 
-def get_bibtex_from_info(info: dict, condensed: bool):
-    bib_url = bibtex_url_from_info(info, condensed)
-    if not bib_url:
-        print("Could not determine BibTeX URL for the selected entry.", file=sys.stderr)
-    bibtex = http_get_text(bib_url).strip()
+# ---------------------------------------------------------------------------
+# BibTeX generation
+# ---------------------------------------------------------------------------
+
+LATEX_ACCENTS = {
+    "̀": "`", "́": "'", "̂": "^", "̃": "~", "̈": '"', "̄": "=",
+    "̆": "u", "̇": ".", "̊": "r", "̋": "H", "̌": "v", "̧": "c",
+    "̨": "k",
+}
+LATEX_LETTERS = {"ß": r"{\ss}", "ø": r"{\o}", "Ø": r"{\O}", "æ": r"{\ae}", "Æ": r"{\AE}",
+                 "œ": r"{\oe}", "Œ": r"{\OE}", "ł": r"{\l}", "Ł": r"{\L}", "đ": r"{\dj}",
+                 "Đ": r"{\DJ}", "ı": r"{\i}"}
+
+
+def to_latex(text: str) -> str:
+    out = []
+    for ch in unicodedata.normalize("NFD", text):
+        if unicodedata.combining(ch):
+            acc = LATEX_ACCENTS.get(ch)
+            if acc is None or not out:
+                continue
+            base = out.pop()
+            if base in ("i", "j"):
+                base = "\\" + base
+            if acc.isalpha():
+                out.append("{\\" + acc + " " + base + "}")
+            else:
+                out.append("{\\" + acc + "{" + base + "}}")
+        else:
+            out.append(LATEX_LETTERS.get(ch, ch))
+    s = "".join(out)
+    for ch, rep in (("&", r"\&"), ("%", r"\%"), ("#", r"\#"), ("_", r"\_")):
+        s = s.replace(ch, rep)
+    return s
+
+
+def bib_type(rec_type: str) -> str:
+    return {"data": "misc"}.get(rec_type, rec_type)
+
+
+def format_entry(key: str, rec_type: str, fields: list) -> str:
+    width = max(len(k) for k, _ in fields) if fields else 0
+    lines = [f"@{rec_type}{{{key},"]
+    for k, v in fields:
+        lines.append(f"  {k.ljust(max(width, 12))} = {{{v}}},")
+    lines[-1] = lines[-1][:-1]
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def record_fields(rec: dict, condensed: bool):
+    f = rec["f"]
+    fields = []
+    for name in BIB_FIELD_ORDER:
+        vals = f.get(name)
+        if not vals:
+            continue
+        if name in ("author", "editor"):
+            v = " and ".join(to_latex(strip_homonym(p)) for p in vals)
+        elif name == "title":
+            v = to_latex(vals[0].rstrip("."))
+        elif name == "pages":
+            v = vals[0].replace("-", "--").replace("----", "--")
+        elif name == "booktitle" and condensed and f.get("crossref"):
+            v = "{" + to_latex(vals[0]) + "}"
+        else:
+            v = to_latex(vals[0])
+        fields.append((name, v))
+    ee = f.get("ee", [])
+    doi = next((e.split("doi.org/", 1)[1] for e in ee if "doi.org/" in e), None)
+    if doi:
+        fields.append(("doi", doi))
+    elif ee:
+        fields.append(("url", ee[0]))
+    arxiv = next((e.rsplit("arxiv.org/abs/", 1)[1] for e in ee if "arxiv.org/abs/" in e), None)
+    if arxiv:
+        fields += [("eprinttype", "arXiv"), ("eprint", arxiv)]
+    fields.append(("biburl", f"https://dblp.org/rec/{rec['key']}.bib"))
+    return fields
+
+
+def get_bibtex_from_info(info: dict, condensed: bool) -> str:
+    rec = info["rec"]
+    crossref = (rec["f"].get("crossref") or [None])[0]
+    fields = record_fields(rec, condensed)
+    parent = get_record(crossref) if (condensed and crossref and rec["type"] == "inproceedings") else None
+    if parent:
+        fields = [(k, v) for k, v in fields if k not in ("publisher", "series", "editor", "volume")]
+        fields.insert(len(fields) - 1, ("crossref", "DBLP:" + crossref))
+    bibtex = format_entry("DBLP:" + rec["key"], bib_type(rec["type"]), fields)
+    if parent:
+        pf = [(k, v) for k, v in record_fields(parent, False)]
+        bibtex += "\n\n" + format_entry("DBLP:" + parent["key"], bib_type(parent["type"]), pf)
     # apply replacements like Markov to {M}arkov
-    for l,r in BIB_REPLACEMENTS:     
-        bibtex = bibtex.replace(l,r)
-    # ensure that we have a url or a doi
-    have_doi = bibtex_has_key(bibtex, "doi")
-    have_url = bibtex_has_key(bibtex, "url")
-    bibtex_lines = bibtex.split("\n")[:-1]
-    bibtex_lines[-1] += "," # ensure that we always end with a comma
-    if not have_doi and not have_url:
-        num_white = bibtex_lines[1].find("=")
-        if "doi" in info:
-            new_line = "  doi{}= {{{}}},".format(" " * (num_white - 5), info["doi"])
-            bibtex_lines.append(new_line)
-        elif "ee" in info:
-            new_line = "  url{}= {{{}}},".format(" " * (num_white - 5), info["ee"])
-            bibtex_lines.append(new_line)
-    # filter lines we don't need
-    unwanted_keys = BIB_UNWANTED_KEYS
-    if have_doi and have_url: # no need for both
-        unwanted_keys.append("url")
-    def keep(line):
-        return not any([ line.strip().startswith(f) for f in BIB_UNWANTED_KEYS])
-    bibtex = "\n".join([l for l in bibtex_lines if keep(l)]).strip()
-    bibtex = bibtex[:-1] + "\n}" # cut away last comma and add closing bracket
+    for l, r in BIB_REPLACEMENTS:
+        bibtex = bibtex.replace(l, r)
     return bibtex
-    
-def prettify_html(text : str) -> str:
+
+
+# ---------------------------------------------------------------------------
+# Command line interface
+# ---------------------------------------------------------------------------
+
+def prettify_html(text: str) -> str:
     return unescape(text.strip())
-    
-def normalize_authors_json(authors_field) -> str:
-    """
-    Handles DBLP JSON author formats, e.g.
-      {"authors": {"author": [{"@pid": "...", "text": "A"}, ...]}}
-      {"authors": {"author": {"@pid": "...", "text": "A"}}}
-    """
-    if not authors_field:
-        return ""
 
-    # authors_field is usually a dict {"author": ...}
-    a = authors_field.get("author") if isinstance(authors_field, dict) else authors_field
-    if not a:
-        return ""
-
-    def name_of(item) -> str:
-        if isinstance(item, str):
-            return item.strip()
-        if isinstance(item, dict):
-            return (item.get("@text") or item.get("text") or item.get("#text") or "").strip()
-        return str(item).strip()
-
-    if isinstance(a, list):
-        names = [name_of(x) for x in a]
-    else:
-        names = [name_of(a)]
-
-    names = [prettify_html(n) for n in names if n]
-    return ", ".join(names)
 
 def get_info_item(info, key):
     res = info.get(key) or ""
@@ -230,17 +386,17 @@ def get_info_item(info, key):
         res = ", ".join([r.strip() for r in res])
     return prettify_html(res)
 
+
 def print_hits(infos):
-    width = shutil.get_terminal_size((120, 20)).columns
     current_year = "unkn"
-    
+
     for i, info in enumerate(infos, start=1):
         title = get_info_item(info, "title")
         year = get_info_item(info, "year")
-        year = "unkn" if  year == "" else year
+        year = "unkn" if year == "" else year
         venue = get_info_item(info, "venue")
-        authors = normalize_authors_json((info.get("_authors_str") or "").strip())
-        
+        authors = get_info_item(info, "authors")
+
         if year != current_year:
             print(f"\033[1m\033[36m{year}\033[0m")
             current_year = year
@@ -265,7 +421,7 @@ def prompt_choice(n: int) -> int:
     while True:
         try:
             s = input(f"\nSelect an entry [1-{n}] (\033[1mq\033[0muit, \033[1mc\033[0mondensed, \033[1mo\033[0mpen url): ").strip()
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, EOFError):
             s = "q"
         if s in {"0", "q", "quit", "exit"} or "q" in s:
             return 0, False, False
@@ -302,19 +458,26 @@ def copy_to_clipboard(text: str):
 
 def open_url_from_info(info: dict):
     url = None
-    if "ee" in info:
+    if info.get("ee"):
         url = info["ee"]
     elif "doi" in info:
-        url = "https://doi/org/" + info["doi"]
+        url = "https://doi.org/" + info["doi"]
     if url is not None:
         # open in new tab
         return webbrowser.open(url, new=2, autoraise=True)
-    
+
 def main():
     parser = argparse.ArgumentParser(description="\033[1m\033[36mqbib\033[0m - Search DBLP and output a selected BibTeX entry.")
-    parser.add_argument("terms", nargs="+", help="Search terms")
+    parser.add_argument("terms", nargs="*", help="Search terms")
     parser.add_argument("-n", "--num", type=int, default=20, help="Max results to show (default: 20)")
+    parser.add_argument("-u", "--update", action="store_true",
+                        help="Download the latest DBLP dump and rebuild the local index (needed once, ~1 GB download)")
     args = parser.parse_args()
+
+    if args.update:
+        return update_index()
+    if not args.terms:
+        parser.error("no search terms given (use --update to build the local index)")
 
     query = " ".join(args.terms).strip()
     infos = search_dblp(query, max_hits=min(max(args.num, 1), 100))
@@ -338,7 +501,7 @@ def main():
 
         info = infos[choice - 1]
         bibtex = get_bibtex_from_info(info, condensed)
-        
+
         HEADING= "\n\033[1m\033[36m" + ("-"*32) + " DBLP  STANDARD " + ("-"*32) + "\033[0m\n"
         if condensed:
             HEADING = HEADING.replace(" STANDARD", "CONDENSED")
